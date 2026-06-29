@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 DEFAULT_RSS_URL = "https://eprint.iacr.org/rss/rss.xml?format=nonstandard"
@@ -29,6 +30,10 @@ ABSTRACT_CHARACTER_LIMIT = 2000
 NOTION_TEXT_LIMIT = 2000
 NOTION_EQUATION_LIMIT = 1000
 NOTION_RICH_TEXT_LIMIT = 100
+ROOT = Path(__file__).resolve().parent
+DEFAULT_SEEN_STATE_PATH = ROOT / "rss_seen_state.json"
+TRUE_VALUES = {"1", "true", "yes", "on"}
+FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -43,9 +48,17 @@ class FeedItem:
 
 
 @dataclass
-class ExistingFeedKeys:
+class SeenFeedState:
     urls: set[str]
     guids: set[str]
+
+
+@dataclass(frozen=True)
+class SyncResult:
+    processed: int
+    created: int
+    skipped_seen: int
+    bootstrapped_seen: int
 
 
 def getenv_required(name: str) -> str:
@@ -337,74 +350,66 @@ def build_page_payload(database_id: str, schema: dict[str, Any], item: FeedItem,
     return payload
 
 
-def query_existing(database_id: str, token: str, field: str, property_type: str, value: str) -> str | None:
-    if property_type not in {"url", "rich_text", "title"} or not value:
-        return None
-    filter_type = "rich_text" if property_type == "title" else property_type
-    payload = {"filter": {"property": field, filter_type: {"equals": value}}, "page_size": 1}
-    result = request_json(f"https://api.notion.com/v1/databases/{database_id}/query", token, "POST", payload)
-    results = result.get("results", [])
-    return results[0]["id"] if results else None
+def seen_state_path() -> Path:
+    value = os.getenv("RSS_SEEN_STATE_PATH")
+    if not value:
+        return DEFAULT_SEEN_STATE_PATH
+    path = Path(value)
+    return path if path.is_absolute() else ROOT / path
 
 
-def find_existing_page(database_id: str, token: str, schema: dict[str, Any], item: FeedItem) -> str | None:
-    properties = schema["properties"]
-    for field, value in (
-        (choose_property(properties, ("URL", "Link", "Article URL")), item.url),
-        (choose_property(properties, ("GUID", "Guid", "ID", "External ID")), item.guid),
-    ):
-        if field:
-            page_id = query_existing(database_id, token, field, properties[field]["type"], value)
-            if page_id:
-                return page_id
-    return None
+def load_seen_state(path: Path | None = None) -> tuple[SeenFeedState, bool]:
+    path = seen_state_path() if path is None else path
+    if not path.exists():
+        return SeenFeedState(urls=set(), guids=set()), False
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{path} must contain a JSON object.")
+    return (
+        SeenFeedState(
+            urls=set(data.get("urls", [])),
+            guids=set(data.get("guids", [])),
+        ),
+        True,
+    )
 
 
-def plain_text(parts: list[dict[str, Any]]) -> str:
-    return "".join(part.get("plain_text", "") for part in parts).strip()
+def save_seen_state(state: SeenFeedState, path: Path | None = None) -> None:
+    path = seen_state_path() if path is None else path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "urls": sorted(state.urls),
+        "guids": sorted(state.guids),
+    }
+    temp_path = path.with_name(path.name + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp_path, path)
 
 
-def page_property_text(page: dict[str, Any], field: str, property_type: str) -> str:
-    value = page.get("properties", {}).get(field, {})
-    if property_type == "url":
-        return (value.get("url") or "").strip()
-    if property_type == "rich_text":
-        return plain_text(value.get("rich_text", []))
-    if property_type == "title":
-        return plain_text(value.get("title", []))
-    return ""
+def bootstrap_seen_enabled() -> bool:
+    value = os.getenv("RSS_BOOTSTRAP_SEEN", "1").strip().lower()
+    if value in FALSE_VALUES:
+        return False
+    return value in TRUE_VALUES or value == ""
 
 
-def collect_existing_feed_keys(database_id: str, token: str, schema: dict[str, Any]) -> ExistingFeedKeys:
-    properties = schema["properties"]
-    url_field = choose_property(properties, ("URL", "Link", "Article URL"))
-    guid_field = choose_property(properties, ("GUID", "Guid", "ID", "External ID"))
-    if not url_field and not guid_field:
-        raise SystemExit("The target database needs a URL/Link or GUID/ID property to detect existing feed items.")
-
-    existing = ExistingFeedKeys(urls=set(), guids=set())
-    cursor = None
-    while True:
-        payload: dict[str, Any] = {"page_size": 100}
-        if cursor:
-            payload["start_cursor"] = cursor
-        result = request_json(f"https://api.notion.com/v1/databases/{database_id}/query", token, "POST", payload)
-        for page in result.get("results", []):
-            if url_field:
-                value = page_property_text(page, url_field, properties[url_field]["type"])
-                if value:
-                    existing.urls.add(value)
-            if guid_field:
-                value = page_property_text(page, guid_field, properties[guid_field]["type"])
-                if value:
-                    existing.guids.add(value)
-        if not result.get("has_more"):
-            return existing
-        cursor = result.get("next_cursor")
+def item_seen(item: FeedItem, state: SeenFeedState) -> bool:
+    return item.url in state.urls or item.guid in state.guids
 
 
-def item_exists(item: FeedItem, existing: ExistingFeedKeys) -> bool:
-    return item.url in existing.urls or item.guid in existing.guids
+def mark_seen(item: FeedItem, state: SeenFeedState) -> None:
+    if item.url:
+        state.urls.add(item.url)
+    if item.guid:
+        state.guids.add(item.guid)
+
+
+def mark_items_seen(items: list[FeedItem], state: SeenFeedState) -> None:
+    for item in items:
+        mark_seen(item, state)
 
 
 def database_title(database: dict[str, Any]) -> str:
@@ -438,38 +443,82 @@ def resolve_database_id(token: str) -> str:
     return find_database_id(token, os.getenv("NOTION_DATABASE_NAME", DEFAULT_DATABASE_NAME))
 
 
-def create_new_items(database_id: str, token: str, items: list[FeedItem], source_name: str) -> tuple[int, int]:
-    schema = request_json(f"https://api.notion.com/v1/databases/{database_id}", token)
-    existing = collect_existing_feed_keys(database_id, token, schema)
-    created = 0
-    skipped = 0
+def create_new_items(
+    database_id: str | None,
+    token: str,
+    items: list[FeedItem],
+    source_name: str,
+    seen_items: list[FeedItem] | None = None,
+    database_name: str | None = None,
+) -> SyncResult:
+    seen_state, state_exists = load_seen_state()
+    if not state_exists and bootstrap_seen_enabled():
+        mark_items_seen(seen_items or items, seen_state)
+        save_seen_state(seen_state)
+        return SyncResult(
+            processed=len(items),
+            created=0,
+            skipped_seen=0,
+            bootstrapped_seen=len(seen_items or items),
+        )
+
+    fresh_items: list[FeedItem] = []
+    skipped_seen = 0
     for item in items:
-        if item_exists(item, existing):
-            skipped += 1
-            continue
+        if item_seen(item, seen_state):
+            skipped_seen += 1
+        else:
+            fresh_items.append(item)
+
+    if not fresh_items:
+        return SyncResult(
+            processed=len(items),
+            created=0,
+            skipped_seen=skipped_seen,
+            bootstrapped_seen=0,
+        )
+
+    resolved_database_id = database_id or find_database_id(
+        token,
+        database_name or os.getenv("NOTION_DATABASE_NAME", DEFAULT_DATABASE_NAME),
+    )
+    schema = request_json(f"https://api.notion.com/v1/databases/{resolved_database_id}", token)
+    created = 0
+    for item in fresh_items:
         request_json(
             "https://api.notion.com/v1/pages",
             token,
             "POST",
-            build_page_payload(database_id, schema, item, source_name),
+            build_page_payload(resolved_database_id, schema, item, source_name),
         )
-        existing.urls.add(item.url)
-        existing.guids.add(item.guid)
+        mark_seen(item, seen_state)
+        save_seen_state(seen_state)
         created += 1
-    return created, skipped
+    return SyncResult(
+        processed=len(items),
+        created=created,
+        skipped_seen=skipped_seen,
+        bootstrapped_seen=0,
+    )
 
 
 def main() -> int:
     rss_url = os.getenv("RSS_URL", DEFAULT_RSS_URL)
     source_name = os.getenv("RSS_SOURCE_NAME", DEFAULT_SOURCE_NAME)
     token = getenv_required("NOTION_TOKEN")
-    database_id = resolve_database_id(token)
-    items = parse_rss(fetch_text(rss_url))
+    database_id = os.getenv("NOTION_DATABASE_ID")
+    database_name = os.getenv("NOTION_DATABASE_NAME", DEFAULT_DATABASE_NAME)
+    all_items = parse_rss(fetch_text(rss_url))
+    items = all_items
     limit = os.getenv("RSS_LIMIT")
     if limit:
         items = items[: int(limit)]
-    created, skipped = create_new_items(database_id, token, items, source_name)
-    print(f"Processed {len(items)} feed items from {rss_url}; created={created}, skipped_existing={skipped}")
+    result = create_new_items(database_id, token, items, source_name, seen_items=all_items, database_name=database_name)
+    print(
+        f"Processed {result.processed} feed items from {rss_url}; "
+        f"created={result.created}, skipped_seen={result.skipped_seen}, "
+        f"bootstrapped_seen={result.bootstrapped_seen}"
+    )
     return 0
 
 

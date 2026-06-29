@@ -4,6 +4,7 @@ __pycache__/
 .env.*
 !.env.example
 rss_config.json
+rss_seen_state.json*
 rss_watcher.log*
 rss_daemon.pid
 rss_daemon.stop

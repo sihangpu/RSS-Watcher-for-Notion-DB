@@ -33,6 +33,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rss_source_name": rss_watcher.DEFAULT_SOURCE_NAME,
     "rss_user_agent": "",
     "interval_minutes": 60,
+    "seen_state_path": "",
+    "bootstrap_seen": "1",
 }
 
 ENV_OVERRIDES = {
@@ -43,6 +45,8 @@ ENV_OVERRIDES = {
     "rss_source_name": "RSS_SOURCE_NAME",
     "rss_user_agent": "RSS_USER_AGENT",
     "interval_minutes": "RSS_INTERVAL_MINUTES",
+    "seen_state_path": "RSS_SEEN_STATE_PATH",
+    "bootstrap_seen": "RSS_BOOTSTRAP_SEEN",
 }
 
 ENV_TEMPLATE = """# Local RSS-to-Notion settings. This file is ignored by git.
@@ -53,6 +57,8 @@ RSS_URL=https://eprint.iacr.org/rss/rss.xml?format=nonstandard
 RSS_SOURCE_NAME=IACR ePrint
 RSS_USER_AGENT=
 RSS_INTERVAL_MINUTES=60
+RSS_SEEN_STATE_PATH=
+RSS_BOOTSTRAP_SEEN=1
 """
 
 
@@ -125,6 +131,8 @@ def watcher_environment(config: dict[str, Any]):
         "RSS_URL": config["rss_url"],
         "RSS_SOURCE_NAME": config["rss_source_name"],
         "RSS_USER_AGENT": config["rss_user_agent"],
+        "RSS_SEEN_STATE_PATH": config["seen_state_path"],
+        "RSS_BOOTSTRAP_SEEN": config["bootstrap_seen"],
     }
     previous = {key: os.environ.get(key) for key in mapping}
     try:
@@ -151,17 +159,25 @@ def run_once(config: dict[str, Any] | None = None, item_limit: int | None = None
 
     with watcher_environment(config):
         token = config["notion_token"]
-        database_id = rss_watcher.resolve_database_id(token)
-        items = rss_watcher.parse_rss(rss_watcher.fetch_text(config["rss_url"]))
+        all_items = rss_watcher.parse_rss(rss_watcher.fetch_text(config["rss_url"]))
+        items = all_items
         if item_limit is not None:
             items = items[:item_limit]
-        created, skipped = rss_watcher.create_new_items(database_id, token, items, config["rss_source_name"])
+        result = rss_watcher.create_new_items(
+            config["notion_database_id"] or None,
+            token,
+            items,
+            config["rss_source_name"],
+            seen_items=all_items,
+            database_name=config["notion_database_name"],
+        )
         return {
             "rss_url": config["rss_url"],
-            "database_id": database_id,
-            "processed": len(items),
-            "created": created,
-            "skipped_existing": skipped,
+            "database_id": config["notion_database_id"],
+            "processed": result.processed,
+            "created": result.created,
+            "skipped_seen": result.skipped_seen,
+            "bootstrapped_seen": result.bootstrapped_seen,
         }
 
 
@@ -220,10 +236,11 @@ def watch_forever() -> None:
             try:
                 result = run_once(config)
                 logger.info(
-                    "Run complete: processed=%s created=%s skipped_existing=%s",
+                    "Run complete: processed=%s created=%s skipped_seen=%s bootstrapped_seen=%s",
                     result["processed"],
                     result["created"],
-                    result["skipped_existing"],
+                    result["skipped_seen"],
+                    result["bootstrapped_seen"],
                 )
             except Exception:
                 logger.exception("Run failed.")
@@ -336,6 +353,7 @@ def service_status() -> dict[str, Any]:
         "task_installed": task_installed(),
         "config_path": str(CONFIG_PATH),
         "env_path": str(ENV_PATH),
+        "seen_state_path": str(rss_watcher.seen_state_path()),
         "log_path": str(LOG_PATH),
     }
 
@@ -360,7 +378,8 @@ def main() -> int:
     if args.once:
         result = run_once(item_limit=args.limit)
         print(
-            "Processed {processed} feed items; created={created}, skipped_existing={skipped_existing}".format(
+            "Processed {processed} feed items; created={created}, skipped_seen={skipped_seen}, "
+            "bootstrapped_seen={bootstrapped_seen}".format(
                 **result
             )
         )
@@ -387,7 +406,7 @@ def main() -> int:
     print(
         f"running={status['running']} pid={status['pid'] or ''} "
         f"task_installed={status['task_installed']} config={status['config_path']} "
-        f"env={status['env_path']} log={status['log_path']}"
+        f"env={status['env_path']} seen_state={status['seen_state_path']} log={status['log_path']}"
     )
     return 0
 

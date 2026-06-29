@@ -21,6 +21,8 @@ Set these environment variables:
 | `RSS_SOURCE_NAME` | no | Source label written to Notion. Defaults to `IACR ePrint`. |
 | `RSS_LIMIT` | no | Maximum items to process from the feed. Defaults to all items. |
 | `RSS_USER_AGENT` | no | User-Agent used for RSS fetches. Defaults to a browser-like Chrome User-Agent to avoid feeds rejecting generic crawler clients. |
+| `RSS_SEEN_STATE_PATH` | no | Local JSON file used to remember RSS items that have already been parsed. Defaults to `rss_seen_state.json`. |
+| `RSS_BOOTSTRAP_SEEN` | no | When `1`, the first run records all currently visible RSS items as already seen and creates nothing. Defaults to `1`. |
 | `NOTION_VERSION` | no | Notion API version. Defaults to `2022-06-28`. |
 
 ## Expected Notion properties
@@ -37,7 +39,11 @@ The watcher can find a Notion database named `RSS Feeds` when `NOTION_DATABASE_I
 - `Tags` / `Categories`
 - `Status` / `Read`
 
-Existing pages are detected by URL first, then GUID. Each run creates only feed items that are not already in the database and skips existing items.
+Freshness is tracked by the local seen-state file, not by querying existing Notion pages. Each normal run creates every feed item whose URL/GUID is absent from the local seen-state file, then records it as seen.
+If you manually delete a Notion item, the watcher will not re-add it because the RSS item remains recorded in the local seen-state file.
+
+On the first run, the watcher bootstraps `rss_seen_state.json` with all currently visible RSS items and creates nothing. This prevents old feed items, including ones you deleted from Notion, from being imported as if they were new. After that, only RSS items that appear for the first time are eligible to be created.
+Set `RSS_BOOTSTRAP_SEEN=0` only if you intentionally want the first run to import missing current feed items.
 
 List-valued feed fields, such as authors and categories, are written as clean text or native Notion select values instead of Python list formatting like `['value']`.
 The RSS item abstract/description is also written into the Notion page body as a paragraph, truncated to 2000 characters.
@@ -81,6 +87,8 @@ NOTION_DATABASE_NAME=RSS Feeds
 RSS_URL=https://eprint.iacr.org/rss/rss.xml?format=nonstandard
 RSS_SOURCE_NAME=IACR ePrint
 RSS_INTERVAL_MINUTES=60
+RSS_SEEN_STATE_PATH=
+RSS_BOOTSTRAP_SEEN=1
 ```
 
 Then run:
@@ -101,6 +109,7 @@ python rss_daemon.py --uninstall-startup
 
 The daemon reads settings from `rss_config.json`, then `.env`, then real environment variables. Later sources override earlier ones.
 Token-bearing local files such as `.env`, `.env.*`, and `rss_config.json` are ignored by git.
+The seen-state file `rss_seen_state.json` is also ignored by git and should stay on the machine running the daemon.
 Logs are written to `rss_watcher.log`, which is also ignored.
 
 `--install-startup` starts the watcher when the Windows user signs in after power on. Starting before sign-in requires an elevated boot task; run `python rss_daemon.py --install-boot` from an administrator PowerShell if you need that behavior.
