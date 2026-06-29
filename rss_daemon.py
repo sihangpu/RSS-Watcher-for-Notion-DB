@@ -176,6 +176,7 @@ def run_once(config: dict[str, Any] | None = None, item_limit: int | None = None
             "database_id": config["notion_database_id"],
             "processed": result.processed,
             "created": result.created,
+            "skipped_existing": result.skipped_existing,
             "skipped_seen": result.skipped_seen,
             "bootstrapped_seen": result.bootstrapped_seen,
         }
@@ -236,9 +237,10 @@ def watch_forever() -> None:
             try:
                 result = run_once(config)
                 logger.info(
-                    "Run complete: processed=%s created=%s skipped_seen=%s bootstrapped_seen=%s",
+                    "Run complete: processed=%s created=%s skipped_existing=%s skipped_seen=%s bootstrapped_seen=%s",
                     result["processed"],
                     result["created"],
+                    result["skipped_existing"],
                     result["skipped_seen"],
                     result["bootstrapped_seen"],
                 )
@@ -378,8 +380,8 @@ def main() -> int:
     if args.once:
         result = run_once(item_limit=args.limit)
         print(
-            "Processed {processed} feed items; created={created}, skipped_seen={skipped_seen}, "
-            "bootstrapped_seen={bootstrapped_seen}".format(
+            "Processed {processed} feed items; created={created}, skipped_existing={skipped_existing}, "
+            "skipped_seen={skipped_seen}, bootstrapped_seen={bootstrapped_seen}".format(
                 **result
             )
         )
