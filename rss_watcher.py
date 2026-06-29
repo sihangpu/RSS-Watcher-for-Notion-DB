@@ -57,6 +57,7 @@ class SeenFeedState:
 class SyncResult:
     processed: int
     created: int
+    skipped_existing: int
     skipped_seen: int
     bootstrapped_seen: int
 
@@ -350,6 +351,32 @@ def build_page_payload(database_id: str, schema: dict[str, Any], item: FeedItem,
     return payload
 
 
+def page_identity_filter(field: str | None, property_type: str | None, value: str) -> dict[str, Any] | None:
+    if property_type not in {"url", "rich_text", "title"} or not field or not value:
+        return None
+    return {"property": field, property_type: {"equals": value}}
+
+
+def find_existing_page(database_id: str, token: str, schema: dict[str, Any], item: FeedItem) -> str | None:
+    properties = schema["properties"]
+    url_field = choose_property(properties, ("URL", "Link", "Article URL"))
+    guid_field = choose_property(properties, ("GUID", "Guid", "ID", "External ID"))
+    filters = [
+        page_identity_filter(url_field, properties[url_field]["type"] if url_field else None, item.url),
+        page_identity_filter(guid_field, properties[guid_field]["type"] if guid_field else None, item.guid),
+    ]
+    filters = [filter_value for filter_value in filters if filter_value]
+    if not filters:
+        return None
+    payload: dict[str, Any] = {
+        "filter": filters[0] if len(filters) == 1 else {"or": filters},
+        "page_size": 1,
+    }
+    result = request_json(f"https://api.notion.com/v1/databases/{database_id}/query", token, "POST", payload)
+    results = result.get("results", [])
+    return results[0]["id"] if results else None
+
+
 def seen_state_path() -> Path:
     value = os.getenv("RSS_SEEN_STATE_PATH")
     if not value:
@@ -458,6 +485,7 @@ def create_new_items(
         return SyncResult(
             processed=len(items),
             created=0,
+            skipped_existing=0,
             skipped_seen=0,
             bootstrapped_seen=len(seen_items or items),
         )
@@ -474,6 +502,7 @@ def create_new_items(
         return SyncResult(
             processed=len(items),
             created=0,
+            skipped_existing=0,
             skipped_seen=skipped_seen,
             bootstrapped_seen=0,
         )
@@ -484,7 +513,13 @@ def create_new_items(
     )
     schema = request_json(f"https://api.notion.com/v1/databases/{resolved_database_id}", token)
     created = 0
+    skipped_existing = 0
     for item in fresh_items:
+        if find_existing_page(resolved_database_id, token, schema, item):
+            skipped_existing += 1
+            mark_seen(item, seen_state)
+            save_seen_state(seen_state)
+            continue
         request_json(
             "https://api.notion.com/v1/pages",
             token,
@@ -497,6 +532,7 @@ def create_new_items(
     return SyncResult(
         processed=len(items),
         created=created,
+        skipped_existing=skipped_existing,
         skipped_seen=skipped_seen,
         bootstrapped_seen=0,
     )
@@ -516,8 +552,8 @@ def main() -> int:
     result = create_new_items(database_id, token, items, source_name, seen_items=all_items, database_name=database_name)
     print(
         f"Processed {result.processed} feed items from {rss_url}; "
-        f"created={result.created}, skipped_seen={result.skipped_seen}, "
-        f"bootstrapped_seen={result.bootstrapped_seen}"
+        f"created={result.created}, skipped_existing={result.skipped_existing}, "
+        f"skipped_seen={result.skipped_seen}, bootstrapped_seen={result.bootstrapped_seen}"
     )
     return 0
 
