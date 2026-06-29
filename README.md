@@ -39,7 +39,7 @@ The watcher can find a Notion database named `RSS Feeds` when `NOTION_DATABASE_I
 - `Tags` / `Categories`
 - `Status` / `Read`
 
-Freshness is tracked by the local seen-state file, not by querying existing Notion pages. Each normal run creates every feed item whose URL/GUID is absent from the local seen-state file, then records it as seen.
+Freshness is tracked by the local seen-state file. Each normal run first filters out RSS items whose URL/GUID is already in `rss_seen_state.json`; for each remaining fresh item, it runs a filtered Notion query with `page_size=1` to check whether that URL/GUID already exists before creating a page.
 If you manually delete a Notion item, the watcher will not re-add it because the RSS item remains recorded in the local seen-state file.
 
 On the first run, the watcher bootstraps `rss_seen_state.json` with all currently visible RSS items and creates nothing. This prevents old feed items, including ones you deleted from Notion, from being imported as if they were new. After that, only RSS items that appear for the first time are eligible to be created.
