@@ -37,7 +37,10 @@ The watcher can find a Notion database named `RSS Feeds` when `NOTION_DATABASE_I
 - `Tags` / `Categories`
 - `Status` / `Read`
 
-Existing pages are matched by URL first, then GUID. Matching pages are updated; new items are created.
+Existing pages are detected by URL first, then GUID. Each run creates only feed items that are not already in the database and skips existing items.
+
+List-valued feed fields, such as authors and categories, are written as clean text or native Notion select values instead of Python list formatting like `['value']`.
+The RSS item abstract/description is also written into the Notion page body as a paragraph, truncated to 2000 characters.
 
 ## Run
 

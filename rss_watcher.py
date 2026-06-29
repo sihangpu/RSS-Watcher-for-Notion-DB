@@ -25,6 +25,7 @@ BROWSER_USER_AGENT = (
     "Chrome/126.0.0.0 Safari/537.36"
 )
 RSS_ACCEPT_HEADER = "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7"
+ABSTRACT_CHARACTER_LIMIT = 2000
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,12 @@ class FeedItem:
     summary: str
     authors: list[str]
     categories: list[str]
+
+
+@dataclass
+class ExistingFeedKeys:
+    urls: set[str]
+    guids: set[str]
 
 
 def getenv_required(name: str) -> str:
@@ -162,28 +169,47 @@ def choose_property(properties: dict[str, Any], candidates: tuple[str, ...], pro
     return None
 
 
-def rich_text(value: str) -> list[dict[str, Any]]:
-    if not value:
+def feed_text(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(part for item in value if (part := feed_text(item)))
+    return str(value).strip()
+
+
+def first_feed_text(value: Any) -> str:
+    if isinstance(value, list):
+        for item in value:
+            text = feed_text(item)
+            if text:
+                return text
+        return ""
+    return feed_text(value)
+
+
+def rich_text(value: Any) -> list[dict[str, Any]]:
+    text = feed_text(value)
+    if not text:
         return []
-    return [{"type": "text", "text": {"content": value[:2000]}}]
+    return [{"type": "text", "text": {"content": text[:2000]}}]
 
 
 def notion_value(property_type: str, value: Any) -> dict[str, Any] | None:
-    if value in (None, "", []):
+    if value is None or feed_text(value) == "":
         return None
     if property_type == "title":
-        return {"title": rich_text(str(value))}
+        return {"title": rich_text(value)}
     if property_type == "rich_text":
-        return {"rich_text": rich_text(str(value))}
+        return {"rich_text": rich_text(value)}
     if property_type == "url":
-        return {"url": str(value)}
+        return {"url": feed_text(value)}
     if property_type == "date":
-        return {"date": {"start": str(value)}}
+        return {"date": {"start": feed_text(value)}}
     if property_type == "select":
-        return {"select": {"name": str(value)[:100]}}
+        name = first_feed_text(value)
+        return {"select": {"name": name[:100]}} if name else None
     if property_type == "multi_select":
         values = value if isinstance(value, list) else [value]
-        return {"multi_select": [{"name": str(v)[:100]} for v in values if str(v).strip()]}
+        options = [{"name": text[:100]} for item in values if (text := feed_text(item))]
+        return {"multi_select": options} if options else None
     if property_type == "checkbox":
         return {"checkbox": bool(value)}
     return None
@@ -217,6 +243,30 @@ def build_properties(schema: dict[str, Any], item: FeedItem, source_name: str) -
     return notion_properties
 
 
+def page_children(item: FeedItem) -> list[dict[str, Any]]:
+    abstract = feed_text(item.summary)[:ABSTRACT_CHARACTER_LIMIT].strip()
+    if not abstract:
+        return []
+    return [
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text(abstract)},
+        }
+    ]
+
+
+def build_page_payload(database_id: str, schema: dict[str, Any], item: FeedItem, source_name: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "parent": {"database_id": database_id},
+        "properties": build_properties(schema, item, source_name),
+    }
+    children = page_children(item)
+    if children:
+        payload["children"] = children
+    return payload
+
+
 def query_existing(database_id: str, token: str, field: str, property_type: str, value: str) -> str | None:
     if property_type not in {"url", "rich_text", "title"} or not value:
         return None
@@ -239,6 +289,52 @@ def find_existing_page(database_id: str, token: str, schema: dict[str, Any], ite
                 return page_id
     return None
 
+
+def plain_text(parts: list[dict[str, Any]]) -> str:
+    return "".join(part.get("plain_text", "") for part in parts).strip()
+
+
+def page_property_text(page: dict[str, Any], field: str, property_type: str) -> str:
+    value = page.get("properties", {}).get(field, {})
+    if property_type == "url":
+        return (value.get("url") or "").strip()
+    if property_type == "rich_text":
+        return plain_text(value.get("rich_text", []))
+    if property_type == "title":
+        return plain_text(value.get("title", []))
+    return ""
+
+
+def collect_existing_feed_keys(database_id: str, token: str, schema: dict[str, Any]) -> ExistingFeedKeys:
+    properties = schema["properties"]
+    url_field = choose_property(properties, ("URL", "Link", "Article URL"))
+    guid_field = choose_property(properties, ("GUID", "Guid", "ID", "External ID"))
+    if not url_field and not guid_field:
+        raise SystemExit("The target database needs a URL/Link or GUID/ID property to detect existing feed items.")
+
+    existing = ExistingFeedKeys(urls=set(), guids=set())
+    cursor = None
+    while True:
+        payload: dict[str, Any] = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        result = request_json(f"https://api.notion.com/v1/databases/{database_id}/query", token, "POST", payload)
+        for page in result.get("results", []):
+            if url_field:
+                value = page_property_text(page, url_field, properties[url_field]["type"])
+                if value:
+                    existing.urls.add(value)
+            if guid_field:
+                value = page_property_text(page, guid_field, properties[guid_field]["type"])
+                if value:
+                    existing.guids.add(value)
+        if not result.get("has_more"):
+            return existing
+        cursor = result.get("next_cursor")
+
+
+def item_exists(item: FeedItem, existing: ExistingFeedKeys) -> bool:
+    return item.url in existing.urls or item.guid in existing.guids
 
 
 def database_title(database: dict[str, Any]) -> str:
@@ -271,25 +367,26 @@ def resolve_database_id(token: str) -> str:
         return database_id
     return find_database_id(token, os.getenv("NOTION_DATABASE_NAME", DEFAULT_DATABASE_NAME))
 
-def upsert_items(database_id: str, token: str, items: list[FeedItem], source_name: str) -> tuple[int, int]:
+
+def create_new_items(database_id: str, token: str, items: list[FeedItem], source_name: str) -> tuple[int, int]:
     schema = request_json(f"https://api.notion.com/v1/databases/{database_id}", token)
+    existing = collect_existing_feed_keys(database_id, token, schema)
     created = 0
-    updated = 0
+    skipped = 0
     for item in items:
-        properties = build_properties(schema, item, source_name)
-        page_id = find_existing_page(database_id, token, schema, item)
-        if page_id:
-            request_json(f"https://api.notion.com/v1/pages/{page_id}", token, "PATCH", {"properties": properties})
-            updated += 1
-        else:
-            request_json(
-                "https://api.notion.com/v1/pages",
-                token,
-                "POST",
-                {"parent": {"database_id": database_id}, "properties": properties},
-            )
-            created += 1
-    return created, updated
+        if item_exists(item, existing):
+            skipped += 1
+            continue
+        request_json(
+            "https://api.notion.com/v1/pages",
+            token,
+            "POST",
+            build_page_payload(database_id, schema, item, source_name),
+        )
+        existing.urls.add(item.url)
+        existing.guids.add(item.guid)
+        created += 1
+    return created, skipped
 
 
 def main() -> int:
@@ -301,8 +398,8 @@ def main() -> int:
     limit = os.getenv("RSS_LIMIT")
     if limit:
         items = items[: int(limit)]
-    created, updated = upsert_items(database_id, token, items, source_name)
-    print(f"Processed {len(items)} feed items from {rss_url}; created={created}, updated={updated}")
+    created, skipped = create_new_items(database_id, token, items, source_name)
+    print(f"Processed {len(items)} feed items from {rss_url}; created={created}, skipped_existing={skipped}")
     return 0
 
 
