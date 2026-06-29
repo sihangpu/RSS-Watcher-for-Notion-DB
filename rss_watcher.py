@@ -26,6 +26,9 @@ BROWSER_USER_AGENT = (
 )
 RSS_ACCEPT_HEADER = "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7"
 ABSTRACT_CHARACTER_LIMIT = 2000
+NOTION_TEXT_LIMIT = 2000
+NOTION_EQUATION_LIMIT = 1000
+NOTION_RICH_TEXT_LIMIT = 100
 
 
 @dataclass(frozen=True)
@@ -185,11 +188,74 @@ def first_feed_text(value: Any) -> str:
     return feed_text(value)
 
 
-def rich_text(value: Any) -> list[dict[str, Any]]:
-    text = feed_text(value)
+def find_closing_math(value: str, start: int) -> int | None:
+    index = start
+    while True:
+        index = value.find("$", index)
+        if index == -1:
+            return None
+        if index == 0 or value[index - 1] != "\\":
+            return index
+        index += 1
+
+
+def append_text(parts: list[dict[str, Any]], value: str) -> None:
+    while value and len(parts) < NOTION_RICH_TEXT_LIMIT:
+        chunk = value[:NOTION_TEXT_LIMIT]
+        parts.append({"type": "text", "text": {"content": chunk}})
+        value = value[NOTION_TEXT_LIMIT:]
+
+
+def append_equation(parts: list[dict[str, Any]], expression: str) -> None:
+    expression = expression.strip()[:NOTION_EQUATION_LIMIT]
+    if expression and len(parts) < NOTION_RICH_TEXT_LIMIT:
+        parts.append({"type": "equation", "equation": {"expression": expression}})
+
+
+def rich_text(value: Any, *, parse_math: bool = False, limit: int = NOTION_TEXT_LIMIT) -> list[dict[str, Any]]:
+    text = feed_text(value)[:limit]
     if not text:
         return []
-    return [{"type": "text", "text": {"content": text[:2000]}}]
+    if not parse_math:
+        parts: list[dict[str, Any]] = []
+        append_text(parts, text)
+        return parts
+
+    parts = []
+    buffer: list[str] = []
+    index = 0
+    while index < len(text) and len(parts) < NOTION_RICH_TEXT_LIMIT:
+        char = text[index]
+        if char == "\\" and index + 1 < len(text) and text[index + 1] == "$":
+            buffer.append("$")
+            index += 2
+            continue
+        if char != "$":
+            buffer.append(char)
+            index += 1
+            continue
+
+        close_index = find_closing_math(text, index + 1)
+        if close_index is None:
+            buffer.append(char)
+            index += 1
+            continue
+
+        expression = text[index + 1 : close_index].strip()
+        if not expression:
+            buffer.append(text[index : close_index + 1])
+            index = close_index + 1
+            continue
+
+        if buffer:
+            append_text(parts, "".join(buffer))
+            buffer = []
+        append_equation(parts, expression)
+        index = close_index + 1
+
+    if buffer and len(parts) < NOTION_RICH_TEXT_LIMIT:
+        append_text(parts, "".join(buffer))
+    return parts
 
 
 def notion_value(property_type: str, value: Any) -> dict[str, Any] | None:
@@ -217,12 +283,13 @@ def notion_value(property_type: str, value: Any) -> dict[str, Any] | None:
 
 def build_properties(schema: dict[str, Any], item: FeedItem, source_name: str) -> dict[str, Any]:
     properties = schema["properties"]
+    summary_property = choose_property(properties, ("Summary", "Description", "Abstract"))
     field_values = [
         (choose_property(properties, ("Name", "Title"), "title"), item.title),
         (choose_property(properties, ("URL", "Link", "Article URL")), item.url),
         (choose_property(properties, ("Source", "Feed")), source_name),
         (choose_property(properties, ("Published", "Publication Date", "Date", "Pub Date")), item.published),
-        (choose_property(properties, ("Summary", "Description", "Abstract")), item.summary),
+        (summary_property, item.summary),
         (choose_property(properties, ("GUID", "Guid", "ID", "External ID")), item.guid),
         (choose_property(properties, ("Authors", "Author")), item.authors),
         (choose_property(properties, ("Tags", "Categories", "Category")), item.categories),
@@ -236,7 +303,10 @@ def build_properties(schema: dict[str, Any], item: FeedItem, source_name: str) -
             continue
         if not name:
             continue
-        converted = notion_value(properties[name]["type"], value)
+        if name == summary_property and properties[name]["type"] == "rich_text":
+            converted = {"rich_text": rich_text(value, parse_math=True, limit=ABSTRACT_CHARACTER_LIMIT)}
+        else:
+            converted = notion_value(properties[name]["type"], value)
         if converted is not None:
             notion_properties[name] = converted
             written.add(name)
@@ -251,7 +321,7 @@ def page_children(item: FeedItem) -> list[dict[str, Any]]:
         {
             "object": "block",
             "type": "paragraph",
-            "paragraph": {"rich_text": rich_text(abstract)},
+            "paragraph": {"rich_text": rich_text(abstract, parse_math=True, limit=ABSTRACT_CHARACTER_LIMIT)},
         }
     ]
 

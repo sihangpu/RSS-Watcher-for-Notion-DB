@@ -1,3 +1,9 @@
 __pycache__/
 *.py[cod]
 .env
+.env.*
+!.env.example
+rss_config.json
+rss_watcher.log*
+rss_daemon.pid
+rss_daemon.stop

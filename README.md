@@ -41,6 +41,7 @@ Existing pages are detected by URL first, then GUID. Each run creates only feed 
 
 List-valued feed fields, such as authors and categories, are written as clean text or native Notion select values instead of Python list formatting like `['value']`.
 The RSS item abstract/description is also written into the Notion page body as a paragraph, truncated to 2000 characters.
+Inline math surrounded with `$...$` in the description is sent to Notion as equation rich text.
 
 ## Run
 
@@ -59,3 +60,47 @@ If IACR rejects an automated runtime, override the RSS headers instead of relyin
 ```bash
 RSS_USER_AGENT="Mozilla/5.0 ..." NOTION_TOKEN=secret_... python3 rss_watcher.py
 ```
+
+## Background watcher on Windows
+
+The CLI daemon can run the watcher in the background every hour and install a Windows Task Scheduler entry.
+Use the same Python 3 executable for setup and startup; the scheduled task reuses the interpreter that runs `rss_daemon.py`.
+
+Create an ignored local `.env` file:
+
+```powershell
+python rss_daemon.py --init-env
+notepad .env
+```
+
+Fill in at least these values:
+
+```text
+NOTION_TOKEN=secret_...
+NOTION_DATABASE_NAME=RSS Feeds
+RSS_URL=https://eprint.iacr.org/rss/rss.xml?format=nonstandard
+RSS_SOURCE_NAME=IACR ePrint
+RSS_INTERVAL_MINUTES=60
+```
+
+Then run:
+
+```powershell
+python rss_daemon.py --once --limit 1
+python rss_daemon.py --start
+python rss_daemon.py --install-startup
+python rss_daemon.py --status
+```
+
+Useful management commands:
+
+```powershell
+python rss_daemon.py --stop
+python rss_daemon.py --uninstall-startup
+```
+
+The daemon reads settings from `rss_config.json`, then `.env`, then real environment variables. Later sources override earlier ones.
+Token-bearing local files such as `.env`, `.env.*`, and `rss_config.json` are ignored by git.
+Logs are written to `rss_watcher.log`, which is also ignored.
+
+`--install-startup` starts the watcher when the Windows user signs in after power on. Starting before sign-in requires an elevated boot task; run `python rss_daemon.py --install-boot` from an administrator PowerShell if you need that behavior.
