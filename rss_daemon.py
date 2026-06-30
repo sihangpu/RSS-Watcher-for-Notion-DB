@@ -28,48 +28,70 @@ TASK_NAME = "RSS-Notion-Watcher"
 DEFAULT_CONFIG: dict[str, Any] = {
     "notion_token": "",
     "notion_database_id": "",
+    "notion_data_source_id": "",
+    "notion_data_source_name": "",
     "notion_database_name": rss_watcher.DEFAULT_DATABASE_NAME,
     "rss_url": rss_watcher.DEFAULT_RSS_URL,
     "rss_source_name": rss_watcher.DEFAULT_SOURCE_NAME,
     "rss_user_agent": "",
     "interval_minutes": 60,
     "seen_state_path": "",
+    "seen_state_max_items": rss_watcher.DEFAULT_SEEN_STATE_MAX_ITEMS,
     "bootstrap_seen": "1",
+    "log_max_bytes": 1_000_000,
+    "log_backup_count": 3,
 }
 
 ENV_OVERRIDES = {
     "notion_token": "NOTION_TOKEN",
     "notion_database_id": "NOTION_DATABASE_ID",
+    "notion_data_source_id": "NOTION_DATA_SOURCE_ID",
+    "notion_data_source_name": "NOTION_DATA_SOURCE_NAME",
     "notion_database_name": "NOTION_DATABASE_NAME",
     "rss_url": "RSS_URL",
     "rss_source_name": "RSS_SOURCE_NAME",
     "rss_user_agent": "RSS_USER_AGENT",
     "interval_minutes": "RSS_INTERVAL_MINUTES",
     "seen_state_path": "RSS_SEEN_STATE_PATH",
+    "seen_state_max_items": "RSS_SEEN_STATE_MAX_ITEMS",
     "bootstrap_seen": "RSS_BOOTSTRAP_SEEN",
+    "log_max_bytes": "RSS_LOG_MAX_BYTES",
+    "log_backup_count": "RSS_LOG_BACKUP_COUNT",
 }
 
 ENV_TEMPLATE = """# Local RSS-to-Notion settings. This file is ignored by git.
 NOTION_TOKEN=
 NOTION_DATABASE_ID=
+NOTION_DATA_SOURCE_ID=
+NOTION_DATA_SOURCE_NAME=
 NOTION_DATABASE_NAME=RSS Feeds
 RSS_URL=https://eprint.iacr.org/rss/rss.xml?format=nonstandard
 RSS_SOURCE_NAME=IACR ePrint
 RSS_USER_AGENT=
 RSS_INTERVAL_MINUTES=60
 RSS_SEEN_STATE_PATH=
+RSS_SEEN_STATE_MAX_ITEMS=10000
 RSS_BOOTSTRAP_SEEN=1
+RSS_LOG_MAX_BYTES=1000000
+RSS_LOG_BACKUP_COUNT=3
 """
 
 
 def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = DEFAULT_CONFIG | {key: config.get(key, value) for key, value in DEFAULT_CONFIG.items()}
-    try:
-        normalized["interval_minutes"] = max(1, int(normalized.get("interval_minutes") or 60))
-    except (TypeError, ValueError):
-        normalized["interval_minutes"] = 60
+    integer_defaults = {
+        "interval_minutes": 60,
+        "seen_state_max_items": rss_watcher.DEFAULT_SEEN_STATE_MAX_ITEMS,
+        "log_max_bytes": 1_000_000,
+        "log_backup_count": 3,
+    }
+    for key, default in integer_defaults.items():
+        try:
+            normalized[key] = max(1, int(normalized.get(key) or default))
+        except (TypeError, ValueError):
+            normalized[key] = default
     for key in DEFAULT_CONFIG:
-        if key != "interval_minutes":
+        if key not in integer_defaults:
             normalized[key] = str(normalized.get(key, "")).strip()
     return normalized
 
@@ -127,11 +149,14 @@ def watcher_environment(config: dict[str, Any]):
     mapping = {
         "NOTION_TOKEN": config["notion_token"],
         "NOTION_DATABASE_ID": config["notion_database_id"],
+        "NOTION_DATA_SOURCE_ID": config["notion_data_source_id"],
+        "NOTION_DATA_SOURCE_NAME": config["notion_data_source_name"],
         "NOTION_DATABASE_NAME": config["notion_database_name"],
         "RSS_URL": config["rss_url"],
         "RSS_SOURCE_NAME": config["rss_source_name"],
         "RSS_USER_AGENT": config["rss_user_agent"],
         "RSS_SEEN_STATE_PATH": config["seen_state_path"],
+        "RSS_SEEN_STATE_MAX_ITEMS": str(config["seen_state_max_items"]),
         "RSS_BOOTSTRAP_SEEN": config["bootstrap_seen"],
     }
     previous = {key: os.environ.get(key) for key in mapping}
@@ -170,10 +195,13 @@ def run_once(config: dict[str, Any] | None = None, item_limit: int | None = None
             config["rss_source_name"],
             seen_items=all_items,
             database_name=config["notion_database_name"],
+            data_source_id=config["notion_data_source_id"] or None,
+            data_source_name_value=config["notion_data_source_name"] or None,
         )
         return {
             "rss_url": config["rss_url"],
             "database_id": config["notion_database_id"],
+            "data_source_id": config["notion_data_source_id"],
             "processed": result.processed,
             "created": result.created,
             "skipped_existing": result.skipped_existing,
@@ -182,11 +210,17 @@ def run_once(config: dict[str, Any] | None = None, item_limit: int | None = None
         }
 
 
-def setup_logging() -> logging.Logger:
+def setup_logging(config: dict[str, Any] | None = None) -> logging.Logger:
+    config = load_config() if config is None else normalize_config(config)
     logger = logging.getLogger("rss_daemon")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
-        handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        handler = RotatingFileHandler(
+            LOG_PATH,
+            maxBytes=int(config["log_max_bytes"]),
+            backupCount=int(config["log_backup_count"]),
+            encoding="utf-8",
+        )
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logger.addHandler(handler)
     return logger
@@ -227,7 +261,8 @@ def sleep_until_next_run(seconds: int) -> bool:
 
 
 def watch_forever() -> None:
-    logger = setup_logging()
+    config = load_config()
+    logger = setup_logging(config)
     STOP_PATH.unlink(missing_ok=True)
     PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
     logger.info("RSS watcher background service started.")
@@ -349,14 +384,20 @@ def task_installed() -> bool:
 
 def service_status() -> dict[str, Any]:
     pid = read_pid()
+    config = load_config()
+    configured_seen_path = Path(config["seen_state_path"]) if config["seen_state_path"] else rss_watcher.DEFAULT_SEEN_STATE_PATH
+    seen_path = configured_seen_path if configured_seen_path.is_absolute() else ROOT / configured_seen_path
     return {
         "pid": pid,
         "running": is_pid_running(pid),
         "task_installed": task_installed(),
         "config_path": str(CONFIG_PATH),
         "env_path": str(ENV_PATH),
-        "seen_state_path": str(rss_watcher.seen_state_path()),
+        "seen_state_path": str(seen_path),
+        "seen_state_max_items": config["seen_state_max_items"],
         "log_path": str(LOG_PATH),
+        "log_max_bytes": config["log_max_bytes"],
+        "log_backup_count": config["log_backup_count"],
     }
 
 
@@ -408,7 +449,9 @@ def main() -> int:
     print(
         f"running={status['running']} pid={status['pid'] or ''} "
         f"task_installed={status['task_installed']} config={status['config_path']} "
-        f"env={status['env_path']} seen_state={status['seen_state_path']} log={status['log_path']}"
+        f"env={status['env_path']} seen_state={status['seen_state_path']} "
+        f"seen_state_max_items={status['seen_state_max_items']} log={status['log_path']} "
+        f"log_max_bytes={status['log_max_bytes']} log_backup_count={status['log_backup_count']}"
     )
     return 0
 

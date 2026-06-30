@@ -18,8 +18,10 @@ from typing import Any
 
 DEFAULT_RSS_URL = "https://eprint.iacr.org/rss/rss.xml?format=nonstandard"
 DEFAULT_SOURCE_NAME = "IACR ePrint"
-DEFAULT_NOTION_VERSION = "2022-06-28"
+DEFAULT_NOTION_VERSION = "2026-03-11"
+DATA_SOURCE_NOTION_VERSION = "2025-09-03"
 DEFAULT_DATABASE_NAME = "RSS Feeds"
+DEFAULT_SEEN_STATE_MAX_ITEMS = 10_000
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -49,6 +51,7 @@ class FeedItem:
 
 @dataclass
 class SeenFeedState:
+    entries: list[dict[str, str]]
     urls: set[str]
     guids: set[str]
 
@@ -60,6 +63,24 @@ class SyncResult:
     skipped_existing: int
     skipped_seen: int
     bootstrapped_seen: int
+
+
+@dataclass(frozen=True)
+class NotionTarget:
+    id: str
+    object_type: str
+    schema: dict[str, Any]
+    query_url: str
+    page_parent: dict[str, str]
+
+
+class NotionAPIError(RuntimeError):
+    def __init__(self, method: str, url: str, status: int, body: str) -> None:
+        super().__init__(f"Notion API {method} {url} failed: {status} {body}")
+        self.method = method
+        self.url = url
+        self.status = status
+        self.body = body
 
 
 def getenv_required(name: str) -> str:
@@ -78,7 +99,7 @@ def request_json(url: str, token: str, method: str = "GET", payload: dict[str, A
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "Notion-Version": os.getenv("NOTION_VERSION", DEFAULT_NOTION_VERSION),
+            "Notion-Version": os.getenv("NOTION_VERSION") or DEFAULT_NOTION_VERSION,
         },
     )
     try:
@@ -86,7 +107,7 @@ def request_json(url: str, token: str, method: str = "GET", payload: dict[str, A
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Notion API {method} {url} failed: {exc.code} {body}") from exc
+        raise NotionAPIError(method, url, exc.code, body) from exc
 
 
 def fetch_text(url: str) -> str:
@@ -340,9 +361,9 @@ def page_children(item: FeedItem) -> list[dict[str, Any]]:
     ]
 
 
-def build_page_payload(database_id: str, schema: dict[str, Any], item: FeedItem, source_name: str) -> dict[str, Any]:
+def build_page_payload(parent: dict[str, str], schema: dict[str, Any], item: FeedItem, source_name: str) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "parent": {"database_id": database_id},
+        "parent": parent,
         "properties": build_properties(schema, item, source_name),
     }
     children = page_children(item)
@@ -357,7 +378,7 @@ def page_identity_filter(field: str | None, property_type: str | None, value: st
     return {"property": field, property_type: {"equals": value}}
 
 
-def find_existing_page(database_id: str, token: str, schema: dict[str, Any], item: FeedItem) -> str | None:
+def find_existing_page(query_url: str, token: str, schema: dict[str, Any], item: FeedItem) -> str | None:
     properties = schema["properties"]
     url_field = choose_property(properties, ("URL", "Link", "Article URL"))
     guid_field = choose_property(properties, ("GUID", "Guid", "ID", "External ID"))
@@ -372,7 +393,7 @@ def find_existing_page(database_id: str, token: str, schema: dict[str, Any], ite
         "filter": filters[0] if len(filters) == 1 else {"or": filters},
         "page_size": 1,
     }
-    result = request_json(f"https://api.notion.com/v1/databases/{database_id}/query", token, "POST", payload)
+    result = request_json(query_url, token, "POST", payload)
     results = result.get("results", [])
     return results[0]["id"] if results else None
 
@@ -385,31 +406,78 @@ def seen_state_path() -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def seen_state_max_items() -> int:
+    value = os.getenv("RSS_SEEN_STATE_MAX_ITEMS", str(DEFAULT_SEEN_STATE_MAX_ITEMS)).strip()
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return DEFAULT_SEEN_STATE_MAX_ITEMS
+
+
+def normalize_seen_entry(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    url = feed_text(value.get("url", ""))
+    guid = feed_text(value.get("guid", ""))
+    if not url and not guid:
+        return None
+    entry: dict[str, str] = {}
+    if url:
+        entry["url"] = url
+    if guid:
+        entry["guid"] = guid
+    seen_at = feed_text(value.get("seen_at", ""))
+    if seen_at:
+        entry["seen_at"] = seen_at
+    return entry
+
+
+def rebuild_seen_indexes(state: SeenFeedState) -> None:
+    state.urls = {entry["url"] for entry in state.entries if entry.get("url")}
+    state.guids = {entry["guid"] for entry in state.entries if entry.get("guid")}
+
+
+def trim_seen_state(state: SeenFeedState, max_items: int | None = None) -> None:
+    limit = seen_state_max_items() if max_items is None else max(1, max_items)
+    if len(state.entries) > limit:
+        state.entries = state.entries[:limit]
+        rebuild_seen_indexes(state)
+
+
 def load_seen_state(path: Path | None = None) -> tuple[SeenFeedState, bool]:
     path = seen_state_path() if path is None else path
     if not path.exists():
-        return SeenFeedState(urls=set(), guids=set()), False
+        return SeenFeedState(entries=[], urls=set(), guids=set()), False
     with path.open("r", encoding="utf-8") as file:
         data = json.load(file)
     if not isinstance(data, dict):
         raise RuntimeError(f"{path} must contain a JSON object.")
-    return (
-        SeenFeedState(
-            urls=set(data.get("urls", [])),
-            guids=set(data.get("guids", [])),
-        ),
-        True,
-    )
+    entries = [entry for item in data.get("items", []) if (entry := normalize_seen_entry(item))]
+    if not entries:
+        old_urls = [feed_text(value) for value in data.get("urls", []) if feed_text(value)]
+        old_guids = {feed_text(value) for value in data.get("guids", []) if feed_text(value)}
+        for url in old_urls:
+            entry = {"url": url}
+            if url in old_guids:
+                entry["guid"] = url
+                old_guids.remove(url)
+            entries.append(entry)
+        entries.extend({"guid": guid} for guid in sorted(old_guids))
+    state = SeenFeedState(entries=entries, urls=set(), guids=set())
+    rebuild_seen_indexes(state)
+    trim_seen_state(state)
+    return state, True
 
 
 def save_seen_state(state: SeenFeedState, path: Path | None = None) -> None:
     path = seen_state_path() if path is None else path
     path.parent.mkdir(parents=True, exist_ok=True)
+    trim_seen_state(state)
     payload = {
-        "version": 1,
+        "version": 2,
         "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "urls": sorted(state.urls),
-        "guids": sorted(state.guids),
+        "max_items": seen_state_max_items(),
+        "items": state.entries,
     }
     temp_path = path.with_name(path.name + ".tmp")
     temp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -427,20 +495,52 @@ def item_seen(item: FeedItem, state: SeenFeedState) -> bool:
     return item.url in state.urls or item.guid in state.guids
 
 
-def mark_seen(item: FeedItem, state: SeenFeedState) -> None:
+def seen_entry_for_item(item: FeedItem, seen_at: str) -> dict[str, str] | None:
+    entry = {"seen_at": seen_at}
     if item.url:
-        state.urls.add(item.url)
+        entry["url"] = item.url
     if item.guid:
-        state.guids.add(item.guid)
+        entry["guid"] = item.guid
+    return entry if len(entry) > 1 else None
+
+
+def mark_seen(item: FeedItem, state: SeenFeedState) -> None:
+    mark_items_seen([item], state)
 
 
 def mark_items_seen(items: list[FeedItem], state: SeenFeedState) -> None:
+    seen_urls = set(state.urls)
+    seen_guids = set(state.guids)
+    seen_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    new_entries: list[dict[str, str]] = []
     for item in items:
-        mark_seen(item, state)
+        if item.url in seen_urls or item.guid in seen_guids:
+            continue
+        entry = seen_entry_for_item(item, seen_at)
+        if not entry:
+            continue
+        new_entries.append(entry)
+        if item.url:
+            seen_urls.add(item.url)
+        if item.guid:
+            seen_guids.add(item.guid)
+    if new_entries:
+        state.entries = new_entries + state.entries
+        rebuild_seen_indexes(state)
+        trim_seen_state(state)
 
 
 def database_title(database: dict[str, Any]) -> str:
     return "".join(part.get("plain_text", "") for part in database.get("title", []))
+
+
+def data_source_name(data_source: dict[str, Any]) -> str:
+    return feed_text(data_source.get("name", ""))
+
+
+def notion_uses_data_sources() -> bool:
+    version = (os.getenv("NOTION_VERSION") or DEFAULT_NOTION_VERSION).strip()
+    return version >= DATA_SOURCE_NOTION_VERSION
 
 
 def find_database_id(token: str, database_name: str) -> str:
@@ -463,11 +563,124 @@ def find_database_id(token: str, database_name: str) -> str:
     )
 
 
-def resolve_database_id(token: str) -> str:
-    database_id = os.getenv("NOTION_DATABASE_ID")
-    if database_id:
+def retrieve_data_source(token: str, data_source_id: str) -> dict[str, Any]:
+    return request_json(f"https://api.notion.com/v1/data_sources/{data_source_id}", token)
+
+
+def find_data_source_id_by_search(
+    token: str,
+    database_name: str,
+    data_source_name_value: str | None = None,
+) -> str:
+    payload = {
+        "query": database_name,
+        "filter": {"property": "object", "value": "data_source"},
+        "page_size": 25,
+    }
+    result = request_json("https://api.notion.com/v1/search", token, "POST", payload)
+    data_sources = result.get("results", [])
+    if not isinstance(data_sources, list):
+        data_sources = []
+    if data_source_name_value:
+        exact_matches = [
+            source
+            for source in data_sources
+            if data_source_name(source).casefold() == data_source_name_value.casefold()
+        ]
+        if exact_matches:
+            return exact_matches[0]["id"]
+    if len(data_sources) == 1:
+        return data_sources[0]["id"]
+    names = ", ".join(data_source_name(source) or source.get("id", "<unnamed>") for source in data_sources)
+    raise SystemExit(
+        f"Could not uniquely find a Notion data source for database {database_name!r}. "
+        f"Set NOTION_DATA_SOURCE_ID explicitly. Search results: {names or 'none'}"
+    )
+
+
+def find_data_source_id(
+    token: str,
+    database_id: str | None,
+    database_name: str,
+    data_source_name_value: str | None = None,
+) -> str:
+    if not database_id:
+        return find_data_source_id_by_search(token, database_name, data_source_name_value)
+    try:
+        database = request_json(f"https://api.notion.com/v1/databases/{database_id}", token)
+    except NotionAPIError as exc:
+        if exc.status != 404:
+            raise
+        try:
+            retrieve_data_source(token, database_id)
+        except NotionAPIError:
+            raise SystemExit(
+                f"Could not retrieve Notion database {database_id!r} or data source {database_id!r}. "
+                "For Notion-Version 2025-09-03 or newer, set NOTION_DATA_SOURCE_ID to the data source ID, "
+                "or set NOTION_DATABASE_ID to the parent database ID."
+            ) from exc
         return database_id
-    return find_database_id(token, os.getenv("NOTION_DATABASE_NAME", DEFAULT_DATABASE_NAME))
+
+    data_sources = database.get("data_sources", [])
+    if not isinstance(data_sources, list) or not data_sources:
+        raise SystemExit(
+            f"Database {database_id!r} did not expose any data sources. "
+            "Set NOTION_DATA_SOURCE_ID explicitly."
+        )
+    if data_source_name_value:
+        exact_matches = [
+            source
+            for source in data_sources
+            if data_source_name(source).casefold() == data_source_name_value.casefold()
+        ]
+        if exact_matches:
+            return exact_matches[0]["id"]
+    if len(data_sources) == 1:
+        return data_sources[0]["id"]
+    names = ", ".join(data_source_name(source) or source.get("id", "<unnamed>") for source in data_sources)
+    raise SystemExit(
+        f"Database {database_id!r} has multiple data sources. "
+        f"Set NOTION_DATA_SOURCE_ID or NOTION_DATA_SOURCE_NAME explicitly. Data sources: {names}"
+    )
+
+
+def resolve_notion_target(
+    token: str,
+    database_id: str | None,
+    database_name: str,
+    data_source_id: str | None = None,
+    data_source_name_value: str | None = None,
+) -> NotionTarget:
+    if notion_uses_data_sources():
+        resolved_data_source_id = data_source_id or find_data_source_id(
+            token,
+            database_id,
+            database_name,
+            data_source_name_value,
+        )
+        schema = retrieve_data_source(token, resolved_data_source_id)
+        return NotionTarget(
+            id=resolved_data_source_id,
+            object_type="data_source",
+            schema=schema,
+            query_url=f"https://api.notion.com/v1/data_sources/{resolved_data_source_id}/query",
+            page_parent={"data_source_id": resolved_data_source_id},
+        )
+
+    if data_source_id:
+        raise SystemExit(
+            "NOTION_DATA_SOURCE_ID requires NOTION_VERSION=2025-09-03 or newer. "
+            "Unset NOTION_VERSION or use NOTION_DATABASE_ID with older Notion API versions."
+        )
+    resolved_database_id = database_id or find_database_id(token, database_name)
+    schema = request_json(f"https://api.notion.com/v1/databases/{resolved_database_id}", token)
+    return NotionTarget(
+        id=resolved_database_id,
+        object_type="database",
+        schema=schema,
+        query_url=f"https://api.notion.com/v1/databases/{resolved_database_id}/query",
+        page_parent={"database_id": resolved_database_id},
+    )
 
 
 def create_new_items(
@@ -477,6 +690,8 @@ def create_new_items(
     source_name: str,
     seen_items: list[FeedItem] | None = None,
     database_name: str | None = None,
+    data_source_id: str | None = None,
+    data_source_name_value: str | None = None,
 ) -> SyncResult:
     seen_state, state_exists = load_seen_state()
     if not state_exists and bootstrap_seen_enabled():
@@ -507,15 +722,17 @@ def create_new_items(
             bootstrapped_seen=0,
         )
 
-    resolved_database_id = database_id or find_database_id(
+    target = resolve_notion_target(
         token,
+        database_id,
         database_name or os.getenv("NOTION_DATABASE_NAME", DEFAULT_DATABASE_NAME),
+        data_source_id or os.getenv("NOTION_DATA_SOURCE_ID"),
+        data_source_name_value or os.getenv("NOTION_DATA_SOURCE_NAME"),
     )
-    schema = request_json(f"https://api.notion.com/v1/databases/{resolved_database_id}", token)
     created = 0
     skipped_existing = 0
-    for item in fresh_items:
-        if find_existing_page(resolved_database_id, token, schema, item):
+    for item in reversed(fresh_items):
+        if find_existing_page(target.query_url, token, target.schema, item):
             skipped_existing += 1
             mark_seen(item, seen_state)
             save_seen_state(seen_state)
@@ -524,7 +741,7 @@ def create_new_items(
             "https://api.notion.com/v1/pages",
             token,
             "POST",
-            build_page_payload(resolved_database_id, schema, item, source_name),
+            build_page_payload(target.page_parent, target.schema, item, source_name),
         )
         mark_seen(item, seen_state)
         save_seen_state(seen_state)
@@ -543,13 +760,24 @@ def main() -> int:
     source_name = os.getenv("RSS_SOURCE_NAME", DEFAULT_SOURCE_NAME)
     token = getenv_required("NOTION_TOKEN")
     database_id = os.getenv("NOTION_DATABASE_ID")
+    data_source_id = os.getenv("NOTION_DATA_SOURCE_ID")
+    data_source_name_value = os.getenv("NOTION_DATA_SOURCE_NAME")
     database_name = os.getenv("NOTION_DATABASE_NAME", DEFAULT_DATABASE_NAME)
     all_items = parse_rss(fetch_text(rss_url))
     items = all_items
     limit = os.getenv("RSS_LIMIT")
     if limit:
         items = items[: int(limit)]
-    result = create_new_items(database_id, token, items, source_name, seen_items=all_items, database_name=database_name)
+    result = create_new_items(
+        database_id,
+        token,
+        items,
+        source_name,
+        seen_items=all_items,
+        database_name=database_name,
+        data_source_id=data_source_id,
+        data_source_name_value=data_source_name_value,
+    )
     print(
         f"Processed {result.processed} feed items from {rss_url}; "
         f"created={result.created}, skipped_existing={result.skipped_existing}, "
